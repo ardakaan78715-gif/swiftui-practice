@@ -10,6 +10,7 @@ medical device, and they run on synthetic or public data only.
 
 | # | App | What it explores | Screenshot |
 | --- | --- | --- | --- |
+| 01 | [Room Comfort](apps/01-room-comfort) | `Grid`, `ViewThatFits` and `AnyLayout` adapting to width and Dynamic Type | Pending |
 
 ## Running an app
 
