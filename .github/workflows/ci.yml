@@ -45,6 +45,7 @@ jobs:
           PUSH_AFTER: ${{ github.sha }}
         run: |
           all_apps() {
+            [ -d apps ] || return 0
             find apps -mindepth 2 -maxdepth 2 -name project.yml | cut -d / -f 2
           }
 
