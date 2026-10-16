@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App folder inside apps/, or "all"
+        required: true
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: Find the apps to build
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.list.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: List the changed app folders
+        id: list
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_APP: ${{ inputs.app }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          all_apps() {
+            find apps -mindepth 2 -maxdepth 2 -name project.yml | cut -d / -f 2
+          }
+
+          changed_apps() {
+            git diff --name-only "$1" -- apps | cut -d / -f 2
+            if [ -n "$(git diff --name-only "$1" -- .github/workflows/ci.yml)" ]; then
+              all_apps | sort | tail -n 1
+            fi
+          }
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              if [ "$REQUESTED_APP" = all ]; then
+                folders=$(all_apps)
+              else
+                folders=$REQUESTED_APP
+              fi
+              ;;
+            pull_request)
+              folders=$(changed_apps "$PR_BASE...$PR_HEAD")
+              ;;
+            push)
+              if git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                folders=$(changed_apps "$PUSH_BEFORE..$PUSH_AFTER")
+              else
+                folders=$(all_apps)
+              fi
+              ;;
+          esac
+
+          set -f
+          apps=$(
+            for folder in $folders; do
+              if [ -f "apps/$folder/project.yml" ]; then
+                echo "$folder"
+              fi
+            done | jq -R -s -c 'split("\n") | map(select(test("^[0-9]{2}-[a-z][a-z0-9-]*$"))) | unique'
+          )
+
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$apps" = "[]" ]; then
+            echo "::error::No app folder matches '$REQUESTED_APP'"
+            exit 1
+          fi
+
+          echo "Apps to build: $apps"
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+
+  app:
+    name: ${{ matrix.app }}
+    needs: changes
+    if: needs.changes.outputs.apps != '[]'
+    runs-on: macos-26
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    defaults:
+      run:
+        working-directory: apps/${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select the newest stable Xcode
+        run: |
+          version=$(
+            find /Applications -maxdepth 1 -type d -name 'Xcode_*.app' \
+              | sed -n -E 's|^/Applications/Xcode_([0-9]+(\.[0-9]+)*)\.app$|\1|p' \
+              | sort -t . -k 1,1n -k 2,2n -k 3,3n \
+              | tail -n 1
+          )
+          if [ -z "$version" ]; then
+            echo "::error::No stable Xcode found in /Applications"
+            exit 1
+          fi
+          sudo xcode-select --switch "/Applications/Xcode_$version.app"
+          xcodebuild -version
+
+      - name: Find the project and an iPhone simulator
+        run: |
+          project=$(ls -d *.xcodeproj)
+          echo "SCHEME=${project%.xcodeproj}" >> "$GITHUB_ENV"
+
+          sdk=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          device=$(
+            xcrun simctl list devices available -j | jq -c --arg sdk "$sdk" '
+              ($sdk | split(".") | map(tonumber) | .[0:2]) as $newest
+              | .devices
+              | to_entries
+              | map(select(.key | test("SimRuntime\\.iOS-[0-9]")))
+              | map({
+                  version: (.key | capture("iOS-(?<v>[0-9-]+)$").v | split("-") | map(tonumber)),
+                  phones: [.value[] | select(.name | startswith("iPhone"))]
+                })
+              | map(select(.version[0] >= 17 and .version[0:2] <= $newest and (.phones | length > 0)))
+              | sort_by(.version)
+              | last
+              | .phones[0] // empty'
+          )
+          if [ -z "$device" ]; then
+            echo "::error::No available iPhone simulator between iOS 17 and the iOS $sdk SDK"
+            exit 1
+          fi
+          echo "Using $(jq -r .name <<< "$device")"
+          echo "SIMULATOR=$(jq -r .udid <<< "$device")" >> "$GITHUB_ENV"
+
+      - name: Run the tests
+        run: >
+          xcodebuild test
+          -project "$SCHEME.xcodeproj"
+          -scheme "$SCHEME"
+          -destination "id=$SIMULATOR"
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          CODE_SIGNING_ALLOWED=NO
+
+      - name: Build the app for the simulator
+        run: >
+          xcodebuild build
+          -project "$SCHEME.xcodeproj"
+          -scheme "$SCHEME"
+          -destination "id=$SIMULATOR"
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          CODE_SIGNING_ALLOWED=NO
+
+      - name: Launch the app and take a screenshot
+        run: |
+          app="$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator/$SCHEME.app"
+          bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Info.plist")
+          xcrun simctl bootstatus "$SIMULATOR" -b
+          xcrun simctl status_bar "$SIMULATOR" override --time 9:41 --batteryState charged --batteryLevel 100
+          xcrun simctl install "$SIMULATOR" "$app"
+          xcrun simctl launch "$SIMULATOR" "$bundle_id"
+          sleep 5
+          xcrun simctl io booted screenshot "$RUNNER_TEMP/screenshot.png"
+
+      - name: Upload the screenshot
+        uses: actions/upload-artifact@v5
+        with:
+          name: screenshot-${{ matrix.app }}
+          path: ${{ runner.temp }}/screenshot.png
+          if-no-files-found: error
